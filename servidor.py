@@ -6,46 +6,39 @@ import os
 import time
 import re
 import threading
+from datetime import datetime
 from io import BytesIO
+import requests
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, FollowEvent, ShareEvent, GiftEvent, JoinEvent
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURACIÓN Y ESTADOS GLOBALES ---
+# --- CONFIGURACIÓN ---
 NOMBRE_IMPRESORA = "XP-58" 
 CARPETA_TEMP = "temp_print"
 ANCHO_PIXELES = 384  # 48mm exactos
 
 CONFIG = {
-    "unique_id": "@frenyer_chirino",
-    "estado_impresora": "En Línea",
-    "cola_impresion": 0,
+    "unique_id": "@omicodm0",
+    "estado_impresora": "Desconocido",
+    "cola_impresion": [],  # Lista para almacenar los payloads pendientes o fallidos
     "ultima_orden": "Ninguna",
     "estado_tiktok": "Desconectado"
 }
 
 LOGS_EVENTOS = []
+lock_impresora = threading.Lock()
 
 if not os.path.exists(CARPETA_TEMP):
     os.makedirs(CARPETA_TEMP)
 
 def agregar_log(texto):
-    timestamp = time.strftime("%H:%M:%S")
+    timestamp = datetime.now().strftime("%H:%M:%S")
     LOGS_EVENTOS.insert(0, f"[{timestamp}] {texto}")
-    if len(LOGS_EVENTOS) > 50:
+    if len(LOGS_EVENTOS) > 60:
         LOGS_EVENTOS.pop()
-
-def limpiar_temporales():
-    ahora = time.time()
-    for f in os.listdir(CARPETA_TEMP):
-        ruta = os.path.join(CARPETA_TEMP, f)
-        try:
-            if os.stat(ruta).st_mtime < ahora - 3600:
-                os.remove(ruta)
-        except:
-            pass
 
 def limpiar_texto(texto):
     return re.sub(r'[^\x00-\x7f]', r'', texto)
@@ -56,30 +49,51 @@ TRADUCCIONES_REGALOS = {
     "GIFT": "REGALO", "TIKTOK": "TIKTOK", "PANDA": "PANDA", "ICE CREAM": "HELADO"
 }
 
-def enviar_binario_a_impresora(datos_binarios, descripcion=""):
-    global CONFIG
-    limpiar_temporales()
+def verificar_estado_impresora_fisica():
+    """Verifica mediante un comando rápido si Windows detecta la impresora conectada"""
     try:
-        CONFIG["cola_impresion"] += 1
-        CONFIG["ultima_orden"] = descripcion
-        
-        nombre_archivo = f"print_{int(time.time())}_{os.urandom(2).hex()}.bin"
-        file_path = os.path.join(CARPETA_TEMP, nombre_archivo)
-        
-        with open(file_path, "wb") as f:
-            f.write(datos_binarios)
-        
-        subprocess.run(['RawPrint.exe', NOMBRE_IMPRESORA, file_path], check=True)
-        CONFIG["estado_impresora"] = "En Línea"
-        agregar_log(f"🖨️ Impreso con éxito: {descripcion}")
+        resultado = subprocess.run(['wmic', 'printer', 'where', f"Name='{NOMBRE_IMPRESORA}'", 'get', 'WorkOffline'], capture_output=True, text=True)
+        if NOMBRE_IMPRESORA.lower() in resultado.stdout.lower() and "FALSE" in resultado.stdout.upper():
+            CONFIG["estado_impresora"] = "🟢 En Línea"
+            return True
+        else:
+            CONFIG["estado_impresora"] = "🔴 Desconectada / Apagada"
+            return False
+    except:
+        # Método alternativo si wmic no está disponible
+        CONFIG["estado_impresora"] = "🟢 En Línea (Local)"
         return True
-    except Exception as e:
-        CONFIG["estado_impresora"] = "Error / Desconectada"
-        agregar_log(f"❌ Error de impresión: {e}")
-        return False
-    finally:
-        if CONFIG["cola_impresion"] > 0:
-            CONFIG["cola_impresion"] -= 1
+
+def enviar_binario_a_impresora(datos_binarios, descripcion=""):
+    with lock_impresora:
+        verificar_estado_impresora_fisica()
+        try:
+            CONFIG["ultima_orden"] = descripcion
+            # Guardamos en la cola temporal por si hay que reenviar
+            item_cola = {"descripcion": descripcion, "payload": datos_binarios}
+            if item_cola not in CONFIG["cola_impresion"]:
+                CONFIG["cola_impresion"].insert(0, item_cola)
+                if len(CONFIG["cola_impresion"]) > 10:
+                    CONFIG["cola_impresion"].pop()
+
+            nombre_archivo = f"print_{int(time.time())}_{os.urandom(2).hex()}.bin"
+            file_path = os.path.join(CARPETA_TEMP, nombre_archivo)
+            
+            with open(file_path, "wb") as f:
+                f.write(datos_binarios)
+            
+            subprocess.run(['RawPrint.exe', NOMBRE_IMPRESORA, file_path], check=True)
+            CONFIG["estado_impresora"] = "🟢 En Línea"
+            agregar_log(f"🖨️ Impreso con éxito: {descripcion}")
+            
+            # Si se imprimió bien, lo sacamos de la cola activa de pendientes
+            if item_cola in CONFIG["cola_impresion"]:
+                CONFIG["cola_impresion"].remove(item_cola)
+            return True
+        except Exception as e:
+            CONFIG["estado_impresora"] = "🔴 Error / Sin Papel / Apagada"
+            agregar_log(f"❌ Error de impresión en [{descripcion}]: {e}")
+            return False
 
 def imagen_a_payload_escpos(img_pil):
     ancho, alto = img_pil.size
@@ -88,11 +102,8 @@ def imagen_a_payload_escpos(img_pil):
     comando_imagen = bytearray([
         0x1D, 0x76, 0x30, 0, 
         bytes_por_fila & 0xFF, (bytes_por_fila >> 8) & 0xFF, 
-        height_byte := (alto & 0xFF), (alto >> 8) & 0xFF
+        alto & 0xFF, (alto >> 8) & 0xFF
     ])
-    # Corregido alto para bytes
-    comando_imagen[6] = alto & 0xFF
-    comando_imagen[7] = (alto >> 8) & 0xFF
     
     pixels = img_pil.load()
     payload_bits = bytearray()
@@ -112,7 +123,7 @@ def imagen_a_payload_escpos(img_pil):
     AVANCE_FINAL = b'\r\n\r\n\r\n'
     return INIT_PRINTER + comando_imagen + payload_bits + AVANCE_FINAL
 
-# --- FUNCIONES DE CREACIÓN DE TICKETS DE TIKTOK ---
+# --- GENERADORES DE TICKETS ---
 
 def imprimir_ticket_seguidor(nickname):
     try:
@@ -202,7 +213,7 @@ def procesar_e_imprimir_regalo_grande(url_foto, nickname, regalo):
     except Exception as e:
         agregar_log(f"Error regalo grande: {e}")
 
-# --- CLIENTE TIKTOK EN SEGUNDO PLANO ---
+# --- BOT TIKTOK EN SEGUNDO PLANO ---
 cliente_activo = None
 
 def iniciar_bot_tiktok(username):
@@ -247,7 +258,7 @@ def iniciar_bot_tiktok(username):
         CONFIG["estado_tiktok"] = "🔴 Error de Conexión"
         agregar_log(f"Error en bot TikTok: {e}")
 
-# --- RUTAS DE FLASK Y PANEL WEB ---
+# --- INTERFAZ WEB FLASK ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -269,18 +280,19 @@ HTML_TEMPLATE = """
         input { background: #2d2d2d; color: #fff; }
         button { background: #bb86fc; color: #000; font-weight: bold; cursor: pointer; }
         button:hover { background: #9a67ea; }
+        .btn-reenviar { background: #03dac6; color: #000; }
         .logs { background: #000; padding: 10px; border-radius: 5px; height: 350px; overflow-y: auto; font-family: monospace; font-size: 13px; color: #03dac6; }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- Panel Izquierdo: Controles y Estado -->
+        <!-- Panel Izquierdo -->
         <div class="card">
             <h2>🖨️ Estado de la Impresora</h2>
-            <div id="printer-status" class="status-box online">Impresora: Cargando...</div>
-            <p><b>Cola de Impresión:</b> <span id="queue-count">0</span></p>
+            <div id="printer-status" class="status-box online">Verificando...</div>
+            <p><b>Órdenes en Cola:</b> <span id="queue-count">0</span></p>
             <p><b>Última Orden:</b> <span id="last-order">-</span></p>
-            <button onclick="forzarReenvio()">Reenviar / Probar Conexión</button>
+            <button class="btn-reenviar" onclick="forzarReenvio()">🔄 Reenviar Última Orden</button>
 
             <h2 style="margin-top: 25px;">🎯 Configurar TikTok Live</h2>
             <div id="tiktok-status" class="status-box offline">Estado: Desconectado</div>
@@ -292,9 +304,7 @@ HTML_TEMPLATE = """
         <!-- Panel Derecho: Consola en vivo -->
         <div class="card" style="flex: 1.5;">
             <h2>📜 Consola de Eventos en Vivo</h2>
-            <div class="logs" id="logs-box">
-                Cargando registros...
-            </div>
+            <div class="logs" id="logs-box">Cargando registros...</div>
         </div>
     </div>
 
@@ -303,9 +313,11 @@ HTML_TEMPLATE = """
             fetch('/estado_sistema')
                 .then(res => res.json())
                 .then(data => {
-                    document.getElementById('printer-status').className = "status-box " + (data.estado_impresora.includes("En Línea") ? "online" : "offline");
-                    document.getElementById('printer-status').innerText = "Impresora: " + data.estado_impresora;
-                    document.getElementById('queue-count').innerText = data.cola_impresion;
+                    let pBox = document.getElementById('printer-status');
+                    pBox.innerText = "Impresora: " + data.estado_impresora;
+                    pBox.className = "status-box " + (data.estado_impresora.includes("En Línea") ? "online" : "offline");
+                    
+                    document.getElementById('queue-count').innerText = data.cola_impresion.length;
                     document.getElementById('last-order').innerText = data.ultima_orden;
                     
                     let tkBox = document.getElementById('tiktok-status');
@@ -332,7 +344,7 @@ HTML_TEMPLATE = """
                 .then(res => res.json()).then(data => { alert(data.mensaje); });
         }
 
-        setInterval(actualizarDatos, 2000);
+        setInterval(actualizarDatos, 1500);
         actualizarDatos();
     </script>
 </body>
@@ -345,6 +357,7 @@ def index():
 
 @app.route('/estado_sistema')
 def estado_sistema():
+    verificar_estado_impresora_fisica()
     return jsonify({
         "estado_impresora": CONFIG["estado_impresora"],
         "cola_impresion": CONFIG["cola_impresion"],
@@ -356,7 +369,7 @@ def estado_sistema():
 @app.route('/conectar_tiktok', methods=['POST'])
 def conectar_tiktok():
     data = request.json
-    nuevo_user = data.get("username", "@frenyer_chirino")
+    nuevo_user = data.get("username", "@omicodm0")
     if not nuevo_user.startswith("@"):
         nuevo_user = "@" + nuevo_user
     CONFIG["unique_id"] = nuevo_user
@@ -367,59 +380,17 @@ def conectar_tiktok():
 
 @app.route('/forzar_reconexion', methods=['POST'])
 def forzar_reconexion():
-    agregar_log("🔄 Verificación manual de impresora ejecutada.")
-    return jsonify({"mensaje": "Estado de impresora verificado."})
-
-# Rutas originales conservadas por compatibilidad
-@app.route('/imprimir_texto', methods=['POST'])
-def imprimir_texto():
-    limpiar_temporales()
-    data = request.json
-    texto = data.get('texto', '')
-    if not texto: return jsonify({"error": "No enviaste texto"}), 400
-    
-    texto_formateado = texto.replace('\n', '\r\n') + "\r\n\r\n\r\n"
-    ESC, FS = b'\x1b', b'\x1c'
-    datos_finales = ESC + b'@' + FS + b'.' + ESC + b't\x10' + texto_formateado.encode('cp1252', errors='replace')
-    
-    if enviar_binario_a_impresora(datos_finales, "Texto Libre"):
-        return jsonify({"status": "Texto enviado a la impresora"}), 200
-    return jsonify({"error": "Fallo al imprimir texto"}), 500
-
-@app.route('/imprimir_imagen', methods=['POST'])
-def imprimir_imagen():
-    limpiar_temporales()
-    if 'foto' not in request.files: return jsonify({"error": "No se recibió ninguna imagen"}), 400
-    
-    archivo = request.files['foto']
-    ruta_original = os.path.join(CARPETA_TEMP, "original.jpg")
-    archivo.save(ruta_original)
-
-    try:
-        img = Image.open(ruta_original)
-        w_percent = (ANCHO_PIXELES / float(img.size[0]))
-        h_size = int((float(img.size[1]) * float(w_percent)))
-        img = img.resize((ANCHO_PIXELES, h_size), Image.Resampling.LANCZOS).convert('1')
-        
-        payload = imagen_a_payload_escpos(img)
-        if enviar_binario_a_impresora(payload, "Imagen Personalizada"):
-            return jsonify({"status": "Imagen procesada e impresa"}), 200
-        return jsonify({"error": "Fallo al enviar imagen"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Fallo al procesar imagen: {str(e)}"}), 500
-
-@app.route('/estado', methods=['GET'])
-def estado():
-    return jsonify({
-        "mensaje": "Servidor listo",
-        "config": {"ancho": "48mm", "impresora": NOMBRE_IMPRESORA}
-    }), 200
+    if CONFIG["cola_impresion"]:
+        item = CONFIG["cola_impresion"][0]
+        hilo = threading.Thread(target=enviar_binario_a_impresora, args=(item["payload"], item["descripcion"] + " (Reenviado)"))
+        hilo.start()
+        return jsonify({"mensaje": "Reenviando última orden de la cola..."})
+    else:
+        return jsonify({"mensaje": "No hay órdenes pendientes en la cola para reenviar."})
 
 if __name__ == '__main__':
-    # Arrancar hilo de TikTok inicial por defecto
     hilo_inicial = threading.Thread(target=iniciar_bot_tiktok, args=(CONFIG["unique_id"],), daemon=True)
     hilo_inicial.start()
     
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
-    
+    app.run(host='0.0.0.0', port=5000)
+                                              
