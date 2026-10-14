@@ -1,66 +1,395 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 import subprocess
 import os
 import time
+import re
+import threading
+from io import BytesIO
+from TikTokLive import TikTokLiveClient
+from TikTokLive.events import ConnectEvent, FollowEvent, ShareEvent, GiftEvent, JoinEvent
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN Y ESTADOS GLOBALES ---
 NOMBRE_IMPRESORA = "XP-58" 
 CARPETA_TEMP = "temp_print"
 ANCHO_PIXELES = 384  # 48mm exactos
 
+CONFIG = {
+    "unique_id": "@frenyer_chirino",
+    "estado_impresora": "En Línea",
+    "cola_impresion": 0,
+    "ultima_orden": "Ninguna",
+    "estado_tiktok": "Desconectado"
+}
+
+LOGS_EVENTOS = []
+
 if not os.path.exists(CARPETA_TEMP):
     os.makedirs(CARPETA_TEMP)
+
+def agregar_log(texto):
+    timestamp = time.strftime("%H:%M:%S")
+    LOGS_EVENTOS.insert(0, f"[{timestamp}] {texto}")
+    if len(LOGS_EVENTOS) > 50:
+        LOGS_EVENTOS.pop()
 
 def limpiar_temporales():
     ahora = time.time()
     for f in os.listdir(CARPETA_TEMP):
         ruta = os.path.join(CARPETA_TEMP, f)
-        if os.stat(ruta).st_mtime < ahora - 3600:
-            os.remove(ruta)
+        try:
+            if os.stat(ruta).st_mtime < ahora - 3600:
+                os.remove(ruta)
+        except:
+            pass
 
+def limpiar_texto(texto):
+    return re.sub(r'[^\x00-\x7f]', r'', texto)
+
+TRADUCCIONES_REGALOS = {
+    "HEART": "CORAZÓN", "ROSE": "ROSA", "GG": "GG", 
+    "FINGER HEART": "CORAZÓN CON DEDOS", "WAVE": "SALUDO", 
+    "GIFT": "REGALO", "TIKTOK": "TIKTOK", "PANDA": "PANDA", "ICE CREAM": "HELADO"
+}
+
+def enviar_binario_a_impresora(datos_binarios, descripcion=""):
+    global CONFIG
+    limpiar_temporales()
+    try:
+        CONFIG["cola_impresion"] += 1
+        CONFIG["ultima_orden"] = descripcion
+        
+        nombre_archivo = f"print_{int(time.time())}_{os.urandom(2).hex()}.bin"
+        file_path = os.path.join(CARPETA_TEMP, nombre_archivo)
+        
+        with open(file_path, "wb") as f:
+            f.write(datos_binarios)
+        
+        subprocess.run(['RawPrint.exe', NOMBRE_IMPRESORA, file_path], check=True)
+        CONFIG["estado_impresora"] = "En Línea"
+        agregar_log(f"🖨️ Impreso con éxito: {descripcion}")
+        return True
+    except Exception as e:
+        CONFIG["estado_impresora"] = "Error / Desconectada"
+        agregar_log(f"❌ Error de impresión: {e}")
+        return False
+    finally:
+        if CONFIG["cola_impresion"] > 0:
+            CONFIG["cola_impresion"] -= 1
+
+def imagen_a_payload_escpos(img_pil):
+    ancho, alto = img_pil.size
+    bytes_por_fila = ancho // 8  
+    
+    comando_imagen = bytearray([
+        0x1D, 0x76, 0x30, 0, 
+        bytes_por_fila & 0xFF, (bytes_por_fila >> 8) & 0xFF, 
+        height_byte := (alto & 0xFF), (alto >> 8) & 0xFF
+    ])
+    # Corregido alto para bytes
+    comando_imagen[6] = alto & 0xFF
+    comando_imagen[7] = (alto >> 8) & 0xFF
+    
+    pixels = img_pil.load()
+    payload_bits = bytearray()
+    
+    for y in range(alto):
+        for b in range(bytes_por_fila):
+            byte_actual = 0
+            for bit in range(8):
+                x = b * 8 + bit
+                if x < ancho:
+                    if pixels[x, y] == 0:
+                        byte_actual |= (1 << (7 - bit))
+            payload_bits.append(byte_actual)
+            
+    ESC = b'\x1b'
+    INIT_PRINTER = ESC + b'@'
+    AVANCE_FINAL = b'\r\n\r\n\r\n'
+    return INIT_PRINTER + comando_imagen + payload_bits + AVANCE_FINAL
+
+# --- FUNCIONES DE CREACIÓN DE TICKETS DE TIKTOK ---
+
+def imprimir_ticket_seguidor(nickname):
+    try:
+        nickname_limpio = limpiar_texto(nickname).upper()
+        img = Image.new("RGB", (ANCHO_PIXELES, 90), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        d.text((10, 10), "****************************************", fill=(0,0,0))
+        d.text((10, 35), f"¡NUEVO SEGUIDOR: {nickname_limpio}!", fill=(0,0,0))
+        d.text((10, 65), "****************************************", fill=(0,0,0))
+        
+        payload = imagen_a_payload_escpos(img.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
+        enviar_binario_a_impresora(payload, f"Follow - {nickname_limpio}")
+    except Exception as e:
+        agregar_log(f"Error seguidor: {e}")
+
+def imprimir_ticket_union(nickname):
+    try:
+        nickname_limpio = limpiar_texto(nickname).upper()
+        img = Image.new("RGB", (ANCHO_PIXELES, 60), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        d.text((10, 20), f"HELLO {nickname_limpio}", fill=(0,0,0))
+        
+        payload = imagen_a_payload_escpos(img.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
+        enviar_binario_a_impresora(payload, f"Join - {nickname_limpio}")
+    except Exception as e:
+        agregar_log(f"Error unión: {e}")
+
+def imprimir_regalo_pequeno_lateral(url_foto, nickname, regalo):
+    """Regalos pequeños (<5 monedas): Foto miniatura a la izquierda + texto al lado"""
+    try:
+        nickname_limpio = limpiar_texto(nickname).upper()
+        regalo_limpio = TRADUCCIONES_REGALOS.get(limpiar_texto(regalo).upper(), limpiar_texto(regalo).upper())
+        
+        ticket = Image.new("RGB", (ANCHO_PIXELES, 90), (255, 255, 255))
+        
+        if url_foto:
+            resp = requests.get(url_foto, timeout=5)
+            if resp.status_code == 200:
+                avatar = Image.open(BytesIO(resp.content)).convert("RGB")
+                avatar = avatar.resize((70, 70), Image.Resampling.LANCZOS)
+                ticket.paste(avatar, (15, 10))
+                
+        d = ImageDraw.Draw(ticket)
+        d.text((100, 15), nickname_limpio, fill=(0,0,0))
+        d.text((100, 45), f"Gracias por 1 x {regalo_limpio}!", fill=(0,0,0))
+        d.line([(10, 85), (ANCHO_PIXELES - 10, 85)], fill=0, width=2)
+        
+        payload = imagen_a_payload_escpos(ticket.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
+        enviar_binario_a_impresora(payload, f"Regalo Pequeño - {nickname_limpio} ({regalo_limpio})")
+    except Exception as e:
+        agregar_log(f"Error regalo lateral: {e}")
+
+def procesar_e_imprimir_regalo_grande(url_foto, nickname, regalo):
+    """Regalos grandes (>=5 monedas): Foto centrada en grande"""
+    try:
+        resp = requests.get(url_foto, timeout=5)
+        if resp.status_code != 200: return
+        
+        img_perfil = Image.open(BytesIO(resp.content)).convert("RGB")
+        tamano = min(img_perfil.size)
+        img_perfil = img_perfil.crop((0, 0, tamano, tamano))
+        
+        mascara = Image.new("L", (tamano, tamano), 0)
+        ImageDraw.Draw(mascara).ellipse((0, 0, tamano, tamano), fill=255)
+        img_circular = Image.new("RGB", (tamano, tamano), (255, 255, 255))
+        img_circular.paste(img_perfil, (0, 0), mask=mascara)
+        
+        alto_foto = int((ANCHO_PIXELES / tamano) * tamano)
+        img_foto = img_circular.resize((ANCHO_PIXELES, alto_foto), Image.Resampling.LANCZOS)
+        img_foto = ImageEnhance.Brightness(img_foto).enhance(1.35)
+        
+        regalo_limpio = TRADUCCIONES_REGALOS.get(limpiar_texto(regalo).upper(), limpiar_texto(regalo).upper())
+        
+        img_txt = Image.new("RGB", (ANCHO_PIXELES, 120), (255, 255, 255))
+        d = ImageDraw.Draw(img_txt)
+        d.text((20, 10), "****************************************", fill=(0,0,0))
+        d.text((20, 35), limpiar_texto(nickname).upper(), fill=(0,0,0))
+        d.text((20, 70), f"ENVIO: {regalo_limpio}", fill=(0,0,0))
+        d.text((20, 95), "****************************************", fill=(0,0,0))
+        
+        ticket_completo = Image.new("RGB", (ANCHO_PIXELES, alto_foto + 120), (255, 255, 255))
+        ticket_completo.paste(img_foto, (0, 0))
+        ticket_completo.paste(img_txt, (0, alto_foto))
+        
+        payload = imagen_a_payload_escpos(ticket_completo.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
+        enviar_binario_a_impresora(payload, f"Regalo Grande - {nickname} ({regalo_limpio})")
+    except Exception as e:
+        agregar_log(f"Error regalo grande: {e}")
+
+# --- CLIENTE TIKTOK EN SEGUNDO PLANO ---
+cliente_activo = None
+
+def iniciar_bot_tiktok(username):
+    global cliente_activo
+    try:
+        CONFIG["estado_tiktok"] = f"Conectando a {username}..."
+        agregar_log(f"Iniciando conexión con {username}")
+        
+        client = TikTokLiveClient(unique_id=username)
+        cliente_activo = client
+
+        @client.on(ConnectEvent)
+        async def on_connect(event: ConnectEvent):
+            CONFIG["estado_tiktok"] = f"🟢 Conectado a {username}"
+            agregar_log(f"¡Cazador Activo en @{event.unique_id}!")
+
+        @client.on(JoinEvent)
+        async def on_join(event: JoinEvent):
+            imprimir_ticket_union(event.user.nickname)
+
+        @client.on(FollowEvent)
+        async def on_follow(event: FollowEvent):
+            imprimir_ticket_seguidor(event.user.nickname)
+
+        @client.on(GiftEvent)
+        async def on_gift(event: GiftEvent):
+            nickname = event.user.nickname
+            gift_name = event.gift.info.name if hasattr(event.gift, 'info') else "REGALO"
+            monedas = event.gift.info.diamond_count if hasattr(event.gift, 'info') else 1
+            
+            url_avatar = None
+            try: url_avatar = event.user.avatar_thumb.url_list[0]
+            except: pass
+            
+            if monedas >= 5:
+                procesar_e_imprimir_regalo_grande(url_avatar, nickname, gift_name)
+            else:
+                imprimir_regalo_pequeno_lateral(url_avatar, nickname, gift_name)
+
+        client.run()
+    except Exception as e:
+        CONFIG["estado_tiktok"] = "🔴 Error de Conexión"
+        agregar_log(f"Error en bot TikTok: {e}")
+
+# --- RUTAS DE FLASK Y PANEL WEB ---
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel TikTok Printer - Yere</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 15px; }
+        .container { display: flex; flex-direction: column; gap: 15px; max-width: 1200px; margin: auto; }
+        @media(min-width: 768px) { .container { flex-direction: row; } }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); flex: 1; }
+        h2 { color: #bb86fc; margin-top: 0; }
+        .status-box { padding: 10px; border-radius: 5px; margin-bottom: 10px; font-weight: bold; }
+        .online { background: #03dac6; color: #000; }
+        .offline { background: #cf6679; color: #000; }
+        input, button { width: 100%; padding: 10px; margin-top: 8px; border-radius: 5px; border: none; box-sizing: border-box; }
+        input { background: #2d2d2d; color: #fff; }
+        button { background: #bb86fc; color: #000; font-weight: bold; cursor: pointer; }
+        button:hover { background: #9a67ea; }
+        .logs { background: #000; padding: 10px; border-radius: 5px; height: 350px; overflow-y: auto; font-family: monospace; font-size: 13px; color: #03dac6; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Panel Izquierdo: Controles y Estado -->
+        <div class="card">
+            <h2>🖨️ Estado de la Impresora</h2>
+            <div id="printer-status" class="status-box online">Impresora: Cargando...</div>
+            <p><b>Cola de Impresión:</b> <span id="queue-count">0</span></p>
+            <p><b>Última Orden:</b> <span id="last-order">-</span></p>
+            <button onclick="forzarReenvio()">Reenviar / Probar Conexión</button>
+
+            <h2 style="margin-top: 25px;">🎯 Configurar TikTok Live</h2>
+            <div id="tiktok-status" class="status-box offline">Estado: Desconectado</div>
+            <label>Usuario actual:</label>
+            <input type="text" id="username-input" value="{{ unique_id }}">
+            <button onclick="cambiarUsuario()">Cambiar y Conectar Cuenta</button>
+        </div>
+
+        <!-- Panel Derecho: Consola en vivo -->
+        <div class="card" style="flex: 1.5;">
+            <h2>📜 Consola de Eventos en Vivo</h2>
+            <div class="logs" id="logs-box">
+                Cargando registros...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function actualizarDatos() {
+            fetch('/estado_sistema')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('printer-status').className = "status-box " + (data.estado_impresora.includes("En Línea") ? "online" : "offline");
+                    document.getElementById('printer-status').innerText = "Impresora: " + data.estado_impresora;
+                    document.getElementById('queue-count').innerText = data.cola_impresion;
+                    document.getElementById('last-order').innerText = data.ultima_orden;
+                    
+                    let tkBox = document.getElementById('tiktok-status');
+                    tkBox.innerText = data.estado_tiktok;
+                    tkBox.className = "status-box " + (data.estado_tiktok.includes("Conectado") ? "online" : "offline");
+
+                    let logsHtml = "";
+                    data.logs.forEach(log => { logsHtml += log + "<br>"; });
+                    document.getElementById('logs-box').innerHTML = logsHtml;
+                });
+        }
+
+        function cambiarUsuario() {
+            let nuevoUser = document.getElementById('username-input').value;
+            fetch('/conectar_tiktok', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username: nuevoUser})
+            }).then(res => res.json()).then(data => { alert(data.mensaje); });
+        }
+
+        function forzarReenvio() {
+            fetch('/forzar_reconexion', {method: 'POST'})
+                .then(res => res.json()).then(data => { alert(data.mensaje); });
+        }
+
+        setInterval(actualizarDatos, 2000);
+        actualizarDatos();
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, unique_id=CONFIG["unique_id"])
+
+@app.route('/estado_sistema')
+def estado_sistema():
+    return jsonify({
+        "estado_impresora": CONFIG["estado_impresora"],
+        "cola_impresion": CONFIG["cola_impresion"],
+        "ultima_orden": CONFIG["ultima_orden"],
+        "estado_tiktok": CONFIG["estado_tiktok"],
+        "logs": LOGS_EVENTOS
+    })
+
+@app.route('/conectar_tiktok', methods=['POST'])
+def conectar_tiktok():
+    data = request.json
+    nuevo_user = data.get("username", "@frenyer_chirino")
+    if not nuevo_user.startswith("@"):
+        nuevo_user = "@" + nuevo_user
+    CONFIG["unique_id"] = nuevo_user
+    
+    hilo = threading.Thread(target=iniciar_bot_tiktok, args=(nuevo_user,), daemon=True)
+    hilo.start()
+    return jsonify({"mensaje": f"Intentando conectar a {nuevo_user}..."})
+
+@app.route('/forzar_reconexion', methods=['POST'])
+def forzar_reconexion():
+    agregar_log("🔄 Verificación manual de impresora ejecutada.")
+    return jsonify({"mensaje": "Estado de impresora verificado."})
+
+# Rutas originales conservadas por compatibilidad
 @app.route('/imprimir_texto', methods=['POST'])
 def imprimir_texto():
     limpiar_temporales()
     data = request.json
     texto = data.get('texto', '')
+    if not texto: return jsonify({"error": "No enviaste texto"}), 400
     
-    if not texto:
-        return jsonify({"error": "No enviaste texto"}), 400
-
-    texto_formateado = texto.replace('\n', '\r\n')
-    texto_formateado += "\r\n\r\n\r\n"
-
-    ESC = b'\x1b'
-    FS = b'\x1c'
-    INIT_PRINTER = ESC + b'@'          
-    APAGAR_CHINO = FS + b'.'           
-    TABLA_LATINO = ESC + b't\x10'     
-
-    texto_en_bytes = texto_formateado.encode('cp1252', errors='replace')
-    datos_finales = INIT_PRINTER + APAGAR_CHINO + TABLA_LATINO + texto_en_bytes
-
-    nombre_archivo = f"nota_{int(time.time())}.txt"
-    file_path = os.path.join(CARPETA_TEMP, nombre_archivo)
+    texto_formateado = texto.replace('\n', '\r\n') + "\r\n\r\n\r\n"
+    ESC, FS = b'\x1b', b'\x1c'
+    datos_finales = ESC + b'@' + FS + b'.' + ESC + b't\x10' + texto_formateado.encode('cp1252', errors='replace')
     
-    with open(file_path, "wb") as f:
-        f.write(datos_finales)
-    
-    try:
-        subprocess.run(['RawPrint.exe', NOMBRE_IMPRESORA, file_path], check=True)
-        return jsonify({"status": "Texto enviado a la Roccia"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if enviar_binario_a_impresora(datos_finales, "Texto Libre"):
+        return jsonify({"status": "Texto enviado a la impresora"}), 200
+    return jsonify({"error": "Fallo al imprimir texto"}), 500
 
 @app.route('/imprimir_imagen', methods=['POST'])
 def imprimir_imagen():
     limpiar_temporales()
-    if 'foto' not in request.files:
-        return jsonify({"error": "No se recibió ninguna imagen"}), 400
+    if 'foto' not in request.files: return jsonify({"error": "No se recibió ninguna imagen"}), 400
     
     archivo = request.files['foto']
     ruta_original = os.path.join(CARPETA_TEMP, "original.jpg")
@@ -68,59 +397,14 @@ def imprimir_imagen():
 
     try:
         img = Image.open(ruta_original)
-        
-        # 1. Redimensionamos proporcionalmente al ancho de la tiquetera (384 px)
         w_percent = (ANCHO_PIXELES / float(img.size[0]))
         h_size = int((float(img.size[1]) * float(w_percent)))
-        img = img.resize((ANCHO_PIXELES, h_size), Image.Resampling.LANCZOS)
+        img = img.resize((ANCHO_PIXELES, h_size), Image.Resampling.LANCZOS).convert('1')
         
-        # 2. Convertimos a Blanco y Negro puro (1-bit por píxel)
-        img = img.convert('1') 
-        
-        # --- TRUCO MAESTRO: CONVERSIÓN A COMANDOS NATIVOS ESC/POS ---
-        width, height = img.size
-        bytes_por_fila = width // 8  # 384 / 8 = 48 bytes por fila
-        
-        # Comando de Hardware: GS v 0 (Imprimir mapa de bits directo)
-        # Estructura: GS v 0 m xL xH yL yH
-        comando_imagen = bytearray([
-            0x1D, 0x76, 0x30, 0, 
-            bytes_por_fila & 0xFF, (bytes_por_fila >> 8) & 0xFF, 
-            height & 0xFF, (height >> 8) & 0xFF
-        ])
-        
-        pixels = img.load()
-        payload_bits = bytearray()
-        
-        # Recorremos la foto píxel por píxel para armar los bytes correspondientes
-        for y in range(height):
-            for b in range(bytes_por_fila):
-                byte_actual = 0
-                for bit in range(8):
-                    x = b * 8 + bit
-                    if x < width:
-                        # En PIL, 0 es negro. En la impresora, 1 es pintar con calor (negro).
-                        if pixels[x, y] == 0:
-                            byte_actual |= (1 << (7 - bit))
-                payload_bits.append(byte_actual)
-        
-        # Inicialización y espaciado final para el corte
-        ESC = b'\x1b'
-        INIT_PRINTER = ESC + b'@'
-        AVANCE_FINAL = b'\r\n\r\n\r\n'
-        
-        # Unimos todo el paquete binario listo para el hardware
-        datos_impresion = INIT_PRINTER + comando_imagen + payload_bits + AVANCE_FINAL
-
-        # 3. Guardamos como un archivo binario puro (.bin)
-        ruta_lista = os.path.join(CARPETA_TEMP, f"print_{int(time.time())}.bin")
-        with open(ruta_lista, "wb") as f:
-            f.write(datos_impresion)
-
-        # 4. Enviamos el binario traducido a la impresora
-        subprocess.run(['RawPrint.exe', NOMBRE_IMPRESORA, ruta_lista], check=True)
-        return jsonify({"status": "Imagen procesada e impresa"}), 200
-    
+        payload = imagen_a_payload_escpos(img)
+        if enviar_binario_a_impresora(payload, "Imagen Personalizada"):
+            return jsonify({"status": "Imagen procesada e impresa"}), 200
+        return jsonify({"error": "Fallo al enviar imagen"}), 500
     except Exception as e:
         return jsonify({"error": f"Fallo al procesar imagen: {str(e)}"}), 500
 
@@ -132,4 +416,10 @@ def estado():
     }), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # Arrancar hilo de TikTok inicial por defecto
+    hilo_inicial = threading.Thread(target=iniciar_bot_tiktok, args=(CONFIG["unique_id"],), daemon=True)
+    hilo_inicial.start()
+    
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+    
