@@ -22,8 +22,8 @@ ANCHO_PIXELES = 384  # 48mm exactos
 
 CONFIG = {
     "unique_id": "@omicodm0",
-    "estado_impresora": "Desconocido",
-    "cola_impresion": [],  # Lista para almacenar los payloads pendientes o fallidos
+    "estado_impresora": "Verificando...",
+    "cola_impresion": [],
     "ultima_orden": "Ninguna",
     "estado_tiktok": "Desconectado"
 }
@@ -50,7 +50,6 @@ TRADUCCIONES_REGALOS = {
 }
 
 def verificar_estado_impresora_fisica():
-    """Verifica mediante un comando rápido si Windows detecta la impresora conectada"""
     try:
         resultado = subprocess.run(['wmic', 'printer', 'where', f"Name='{NOMBRE_IMPRESORA}'", 'get', 'WorkOffline'], capture_output=True, text=True)
         if NOMBRE_IMPRESORA.lower() in resultado.stdout.lower() and "FALSE" in resultado.stdout.upper():
@@ -60,7 +59,6 @@ def verificar_estado_impresora_fisica():
             CONFIG["estado_impresora"] = "🔴 Desconectada / Apagada"
             return False
     except:
-        # Método alternativo si wmic no está disponible
         CONFIG["estado_impresora"] = "🟢 En Línea (Local)"
         return True
 
@@ -69,7 +67,6 @@ def enviar_binario_a_impresora(datos_binarios, descripcion=""):
         verificar_estado_impresora_fisica()
         try:
             CONFIG["ultima_orden"] = descripcion
-            # Guardamos en la cola temporal por si hay que reenviar
             item_cola = {"descripcion": descripcion, "payload": datos_binarios}
             if item_cola not in CONFIG["cola_impresion"]:
                 CONFIG["cola_impresion"].insert(0, item_cola)
@@ -86,7 +83,6 @@ def enviar_binario_a_impresora(datos_binarios, descripcion=""):
             CONFIG["estado_impresora"] = "🟢 En Línea"
             agregar_log(f"🖨️ Impreso con éxito: {descripcion}")
             
-            # Si se imprimió bien, lo sacamos de la cola activa de pendientes
             if item_cola in CONFIG["cola_impresion"]:
                 CONFIG["cola_impresion"].remove(item_cola)
             return True
@@ -123,8 +119,6 @@ def imagen_a_payload_escpos(img_pil):
     AVANCE_FINAL = b'\r\n\r\n\r\n'
     return INIT_PRINTER + comando_imagen + payload_bits + AVANCE_FINAL
 
-# --- GENERADORES DE TICKETS ---
-
 def imprimir_ticket_seguidor(nickname):
     try:
         nickname_limpio = limpiar_texto(nickname).upper()
@@ -133,7 +127,6 @@ def imprimir_ticket_seguidor(nickname):
         d.text((10, 10), "****************************************", fill=(0,0,0))
         d.text((10, 35), f"¡NUEVO SEGUIDOR: {nickname_limpio}!", fill=(0,0,0))
         d.text((10, 65), "****************************************", fill=(0,0,0))
-        
         payload = imagen_a_payload_escpos(img.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
         enviar_binario_a_impresora(payload, f"Follow - {nickname_limpio}")
     except Exception as e:
@@ -145,75 +138,60 @@ def imprimir_ticket_union(nickname):
         img = Image.new("RGB", (ANCHO_PIXELES, 60), (255, 255, 255))
         d = ImageDraw.Draw(img)
         d.text((10, 20), f"HELLO {nickname_limpio}", fill=(0,0,0))
-        
         payload = imagen_a_payload_escpos(img.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
         enviar_binario_a_impresora(payload, f"Join - {nickname_limpio}")
     except Exception as e:
         agregar_log(f"Error unión: {e}")
 
 def imprimir_regalo_pequeno_lateral(url_foto, nickname, regalo):
-    """Regalos pequeños (<5 monedas): Foto miniatura a la izquierda + texto al lado"""
     try:
         nickname_limpio = limpiar_texto(nickname).upper()
         regalo_limpio = TRADUCCIONES_REGALOS.get(limpiar_texto(regalo).upper(), limpiar_texto(regalo).upper())
-        
         ticket = Image.new("RGB", (ANCHO_PIXELES, 90), (255, 255, 255))
-        
         if url_foto:
             resp = requests.get(url_foto, timeout=5)
             if resp.status_code == 200:
                 avatar = Image.open(BytesIO(resp.content)).convert("RGB")
                 avatar = avatar.resize((70, 70), Image.Resampling.LANCZOS)
                 ticket.paste(avatar, (15, 10))
-                
         d = ImageDraw.Draw(ticket)
         d.text((100, 15), nickname_limpio, fill=(0,0,0))
         d.text((100, 45), f"Gracias por 1 x {regalo_limpio}!", fill=(0,0,0))
         d.line([(10, 85), (ANCHO_PIXELES - 10, 85)], fill=0, width=2)
-        
         payload = imagen_a_payload_escpos(ticket.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
         enviar_binario_a_impresora(payload, f"Regalo Pequeño - {nickname_limpio} ({regalo_limpio})")
     except Exception as e:
         agregar_log(f"Error regalo lateral: {e}")
 
 def procesar_e_imprimir_regalo_grande(url_foto, nickname, regalo):
-    """Regalos grandes (>=5 monedas): Foto centrada en grande"""
     try:
         resp = requests.get(url_foto, timeout=5)
         if resp.status_code != 200: return
-        
         img_perfil = Image.open(BytesIO(resp.content)).convert("RGB")
         tamano = min(img_perfil.size)
         img_perfil = img_perfil.crop((0, 0, tamano, tamano))
-        
         mascara = Image.new("L", (tamano, tamano), 0)
         ImageDraw.Draw(mascara).ellipse((0, 0, tamano, tamano), fill=255)
         img_circular = Image.new("RGB", (tamano, tamano), (255, 255, 255))
         img_circular.paste(img_perfil, (0, 0), mask=mascara)
-        
         alto_foto = int((ANCHO_PIXELES / tamano) * tamano)
         img_foto = img_circular.resize((ANCHO_PIXELES, alto_foto), Image.Resampling.LANCZOS)
         img_foto = ImageEnhance.Brightness(img_foto).enhance(1.35)
-        
         regalo_limpio = TRADUCCIONES_REGALOS.get(limpiar_texto(regalo).upper(), limpiar_texto(regalo).upper())
-        
         img_txt = Image.new("RGB", (ANCHO_PIXELES, 120), (255, 255, 255))
         d = ImageDraw.Draw(img_txt)
         d.text((20, 10), "****************************************", fill=(0,0,0))
         d.text((20, 35), limpiar_texto(nickname).upper(), fill=(0,0,0))
         d.text((20, 70), f"ENVIO: {regalo_limpio}", fill=(0,0,0))
         d.text((20, 95), "****************************************", fill=(0,0,0))
-        
         ticket_completo = Image.new("RGB", (ANCHO_PIXELES, alto_foto + 120), (255, 255, 255))
         ticket_completo.paste(img_foto, (0, 0))
         ticket_completo.paste(img_txt, (0, alto_foto))
-        
         payload = imagen_a_payload_escpos(ticket_completo.convert('1', dither=Image.Dither.FLOYDSTEINBERG))
         enviar_binario_a_impresora(payload, f"Regalo Grande - {nickname} ({regalo_limpio})")
     except Exception as e:
         agregar_log(f"Error regalo grande: {e}")
 
-# --- BOT TIKTOK EN SEGUNDO PLANO ---
 cliente_activo = None
 
 def iniciar_bot_tiktok(username):
@@ -221,13 +199,12 @@ def iniciar_bot_tiktok(username):
     try:
         CONFIG["estado_tiktok"] = f"Conectando a {username}..."
         agregar_log(f"Iniciando conexión con {username}")
-        
         client = TikTokLiveClient(unique_id=username)
         cliente_activo = client
 
         @client.on(ConnectEvent)
         async def on_connect(event: ConnectEvent):
-            CONFIG["estado_tiktok"] = f"🟢 Conectado a {username}"
+            CONFIG["estado_tiktok"] = f"🟢 Conectado @{event.unique_id}"
             agregar_log(f"¡Cazador Activo en @{event.unique_id}!")
 
         @client.on(JoinEvent)
@@ -243,11 +220,9 @@ def iniciar_bot_tiktok(username):
             nickname = event.user.nickname
             gift_name = event.gift.info.name if hasattr(event.gift, 'info') else "REGALO"
             monedas = event.gift.info.diamond_count if hasattr(event.gift, 'info') else 1
-            
             url_avatar = None
             try: url_avatar = event.user.avatar_thumb.url_list[0]
             except: pass
-            
             if monedas >= 5:
                 procesar_e_imprimir_regalo_grande(url_avatar, nickname, gift_name)
             else:
@@ -257,8 +232,6 @@ def iniciar_bot_tiktok(username):
     except Exception as e:
         CONFIG["estado_tiktok"] = "🔴 Error de Conexión"
         agregar_log(f"Error en bot TikTok: {e}")
-
-# --- INTERFAZ WEB FLASK ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -286,7 +259,6 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <!-- Panel Izquierdo -->
         <div class="card">
             <h2>🖨️ Estado de la Impresora</h2>
             <div id="printer-status" class="status-box online">Verificando...</div>
@@ -301,7 +273,6 @@ HTML_TEMPLATE = """
             <button onclick="cambiarUsuario()">Cambiar y Conectar Cuenta</button>
         </div>
 
-        <!-- Panel Derecho: Consola en vivo -->
         <div class="card" style="flex: 1.5;">
             <h2>📜 Consola de Eventos en Vivo</h2>
             <div class="logs" id="logs-box">Cargando registros...</div>
@@ -391,6 +362,5 @@ def forzar_reconexion():
 if __name__ == '__main__':
     hilo_inicial = threading.Thread(target=iniciar_bot_tiktok, args=(CONFIG["unique_id"],), daemon=True)
     hilo_inicial.start()
-    
     app.run(host='0.0.0.0', port=5000)
-                                              
+                                
