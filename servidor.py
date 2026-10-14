@@ -363,4 +363,4 @@ if __name__ == '__main__':
     hilo_inicial = threading.Thread(target=iniciar_bot_tiktok, args=(CONFIG["unique_id"],), daemon=True)
     hilo_inicial.start()
     app.run(host='0.0.0.0', port=5000)
-                                
+            
